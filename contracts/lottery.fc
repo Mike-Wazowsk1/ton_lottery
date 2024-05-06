@@ -1,0 +1,234 @@
+#include "imports/stdlib.fc";
+
+(slice, slice, int, int, int, int, int, cell, int, cell) load_data() inline {
+    slice ds = get_data().begin_parse();
+
+    slice master = ds~load_ref().begin_parse();
+    slice configs = ds~load_ref().begin_parse();
+    slice current_data = ds~load_ref().begin_parse();
+    
+    slice owner_address = master~load_msg_addr();
+    slice dev_wallet = master~load_msg_addr();
+    int dev_reward = master~load_coins();
+
+    int is_locked = configs~load_int(2);
+    int triger_amount = configs~load_coins();
+    int each_ticket_price = configs~load_coins();
+
+    int total_tickets = current_data~load_uint(64);
+    cell players = current_data~load_dict();
+    int round_count = current_data~load_uint(64);
+    cell round_winners = current_data~load_dict();
+
+    ds.end_parse();
+    master.end_parse();
+    configs.end_parse();
+    current_data.end_parse();
+
+    return (owner_address, dev_wallet, dev_reward, is_locked, triger_amount, each_ticket_price, total_tickets, players, round_count, round_winners);
+}
+
+() save_data(slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) impure inline {
+    cell master = begin_cell().store_slice(owner_address).store_slice(dev_wallet).store_coins(dev_reward).end_cell();
+    cell configs = begin_cell().store_int(is_locked, 2).store_coins(triger_amount).store_coins(each_ticket_price).end_cell();
+    cell current_data = begin_cell().store_uint(total_tickets, 64).store_dict(players).store_uint(round_count, 64).store_dict(round_winners).end_cell();
+    cell dc = begin_cell().store_ref(master).store_ref(configs).store_ref(current_data).end_cell();
+    set_data(dc);
+}
+
+int is_in_players?(cell players, slice player_address_267) inline {
+    (_, int player_address_256) = parse_std_addr(player_address_267);
+    (_, int flag) = players.udict_get?(256, player_address_256);
+    return flag;
+}
+
+(slice) find_winner(cell players, int random_amount) inline {
+    (int player_address_256, slice player_data, int flag) = players.udict_get_min?(256);
+    while (flag) {
+        int player_bet_amount = player_data~load_coins();
+        random_amount = random_amount - player_bet_amount;
+        if(random_amount <= 0){
+            slice player_address_267 = begin_cell().store_uint(1024, 11).store_uint(player_address_256, 256).end_cell().begin_parse();
+            return player_address_267;
+        }
+        (player_address_256, player_data, flag) = players.udict_get_next?(256, player_address_256);
+    }
+    return ("");
+}
+
+() simple_transfer(slice receiver, int msg_value) impure inline {
+    send_raw_message(begin_cell().store_uint(0x10, 6).store_slice(receiver).store_coins(msg_value).store_uint(0, 1 + 4 + 4 + 64 + 32 + 1 + 1).end_cell(), 2);
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+    if (flags & 1) {
+        return ();
+    }
+    
+    slice sender_address = cs~load_msg_addr();
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+
+    if (in_msg_body.slice_empty?()) {
+        throw_if(1001, is_locked);        
+        (int tickets, int r) = (msg_value / each_ticket_price, msg_value % each_ticket_price);
+        throw_unless(1002, r == 0);
+        int max_tickets = triger_amount / each_ticket_price;
+        if(tickets + total_tickets > max_tickets) {
+            simple_transfer(sender_address, (tickets - (max_tickets - total_tickets)) * each_ticket_price - 40000000);
+            tickets = max_tickets - total_tickets;
+        }
+        (_, int sender_address_256) = parse_std_addr(sender_address);
+        if (players.is_in_players?(sender_address)) {
+            (slice player_data, _) = players.udict_get?(256, sender_address_256);
+            int previous_tickets = player_data~load_coins();
+            players~udict_set(256, sender_address_256, begin_cell().store_coins(previous_tickets + tickets).end_cell().begin_parse());
+        }
+        else {
+            players~udict_set(256, sender_address_256, begin_cell().store_coins(tickets).end_cell().begin_parse());
+        }
+        total_tickets += tickets;
+        if(total_tickets >= max_tickets){
+            is_locked = -1; ;; true = -1
+        }
+        save_data(owner_address, dev_wallet, dev_reward, is_locked, triger_amount, each_ticket_price, total_tickets, players, round_count, round_winners);
+        return ();
+    }
+
+    int op = in_msg_body~load_uint(32);
+    in_msg_body~load_uint(64); ;; skip query_id
+    
+    if (op == 1) { ;; pick winner
+        throw_unless(1003, equal_slices(sender_address, owner_address));
+        throw_unless(1004, is_locked);
+        randomize_lt();
+        int random_amount = rand(total_tickets);
+        (slice winner_address_267) = players.find_winner(random_amount);
+        int winner_win_amount = my_balance - dev_reward - 40000000;
+        simple_transfer(winner_address_267, winner_win_amount);
+        simple_transfer(dev_wallet, dev_reward);
+        round_count += 1;
+        round_winners~udict_set(64, round_count, winner_address_267);
+        players = new_dict();
+        total_tickets = 0;
+        save_data(owner_address, dev_wallet, dev_reward, is_locked, triger_amount, each_ticket_price, total_tickets, players, round_count, round_winners);
+        return ();
+    }
+
+    if (op == 2) { ;; unlock
+        throw_unless(1003, equal_slices(sender_address, owner_address));
+        is_locked = 0;
+        save_data(owner_address, dev_wallet, dev_reward, is_locked, triger_amount, each_ticket_price, total_tickets, players, round_count, round_winners);
+        return ();
+    }
+
+    if (op == 3) { ;; lock
+        throw_unless(1003, equal_slices(sender_address, owner_address));
+        is_locked = -1;
+        save_data(owner_address, dev_wallet, dev_reward, is_locked, triger_amount, each_ticket_price, total_tickets, players, round_count, round_winners);
+        return ();
+    }
+
+    if (op == 4) { ;; update each ticket price
+        throw_unless(1003, equal_slices(sender_address, owner_address));
+        throw_unless(1004, total_tickets == 0);
+        each_ticket_price = in_msg_body~load_coins();
+        save_data(owner_address, dev_wallet, dev_reward, is_locked, triger_amount, each_ticket_price, total_tickets, players, round_count, round_winners);
+        return ();
+    }
+
+    if (op == 5) { ;; update triger amount
+        throw_unless(1003, equal_slices(sender_address, owner_address));
+        throw_unless(1004, total_tickets == 0);
+        triger_amount = in_msg_body~load_coins();
+        save_data(owner_address, dev_wallet, dev_reward, is_locked, triger_amount, each_ticket_price, total_tickets, players, round_count, round_winners);
+        return ();
+    }
+
+    if (op == 6) { ;; update dev reward
+        throw_unless(1003, equal_slices(sender_address, owner_address));
+        throw_unless(1004, total_tickets == 0);
+        dev_reward = in_msg_body~load_coins();
+        save_data(owner_address, dev_wallet, dev_reward, is_locked, triger_amount, each_ticket_price, total_tickets, players, round_count, round_winners);
+        return ();
+    }
+
+    if (op == 7) { ;; update dev wallet
+        throw_unless(1003, equal_slices(sender_address, owner_address));
+        throw_unless(1004, total_tickets == 0);
+        dev_wallet = in_msg_body~load_msg_addr();
+        save_data(owner_address, dev_wallet, dev_reward, is_locked, triger_amount, each_ticket_price, total_tickets, players, round_count, round_winners);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+(int) get_players_count() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    int count = 0;
+    (int player_address_256, slice player_data, int flag) = players.udict_get_min?(256);
+    while (flag) {
+        count += 1;
+        (player_address_256, player_data, flag) = players.udict_get_next?(256, player_address_256);
+    }
+    return count;
+}
+
+(int) get_each_ticket_price() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    return each_ticket_price;
+}
+
+(slice) get_dev_wallet() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    return dev_wallet;
+}
+
+(cell) get_players() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    return players;
+}
+
+(int) get_issued_tickets_count() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    return total_tickets;
+}
+
+;; (int) get_balance() method_id {
+;;     (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+;;     return ;
+;; }
+
+(slice) get_winner_by_round(int round) method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    (slice round_winner, _) = round_winners.udict_get?(64, round);
+    return round_winner;
+}
+
+(int) get_round_count() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    return round_count;
+}
+
+(int) get_remaining_slots() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    int max_tickets = triger_amount / each_ticket_price;
+    return (max_tickets - total_tickets);
+}
+
+(int) get_triger_amount() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    return triger_amount;
+}
+
+(int) get_win_amount() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    return (triger_amount - dev_reward);
+}
+
+(int) get_dev_reward() method_id {
+    (slice owner_address, slice dev_wallet, int dev_reward, int is_locked, int triger_amount, int each_ticket_price, int total_tickets, cell players, int round_count, cell round_winners) = load_data();
+    return dev_reward;
+}

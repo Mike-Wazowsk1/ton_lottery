@@ -19,3 +19,11 @@
 
 # Go workspace file
 go.work
+
+# ton
+node_modules
+temp
+build
+dist
+.DS_Store
+utils/TON-CENTER-API.ts
